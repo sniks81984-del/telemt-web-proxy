@@ -72,6 +72,8 @@ tg://webproxy?server=<домен>&secret=dd<секрет>
 | `--secret HEX32` | свой секрет (по умолчанию генерируется) |
 | `--carrier C` | `https` (совместимость, iOS) / `https-lanes` / `websocket` / `websocket-lanes` |
 | `--decoy URL` | внешний decoy-upstream вместо встроенного сайта-заглушки |
+| `--cert-method M` | `webroot` (def) или `standalone` (certbot сам биндит :80) |
+| `--no-firewall` | не открывать 80/443 в ufw/firewalld автоматически |
 | `--mtproxy-public` | открыть MTProto-listener наружу (выдаст `tg://proxy` ссылку) |
 | `--version TAG` | конкретная версия telemt (def `latest`) |
 | `--uninstall` | удалить сервис и конфиги; `--purge` — также данные и бинарь |
@@ -88,6 +90,15 @@ certbot renew                    # сертификат продлевается
 ```
 
 Конфиг: `/etc/telemt/config.toml` — после правки `systemctl restart telemt`.
+
+## Сертификат не выдаётся?
+
+Скрипт перед выпуском делает самопроверку `http://<домен>/.well-known/acme-challenge/` и при ошибке certbot печатает хвост его лога. Частые причины:
+
+- **80-й порт закрыт снаружи** — ufw/firewalld (скрипт открывает сам, если они активны) или Security Group/фаервол у хостера — откройте в панели;
+- **стоковый сайт nginx** (`sites-enabled/default`) занимал `default_server` на :80 — скрипт снимает флаг автоматически;
+- **DNS** — домен не резолвится в IP сервера (скрипт предупреждает о несовпадении);
+- альтернатива: `--cert-method standalone` — certbot поднимает свой :80 сам (nginx должен быть остановлен на момент выпуска и продления — хуки ставятся автоматически).
 
 ## Удаление
 

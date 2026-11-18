@@ -48,6 +48,8 @@ CARRIER="https"            # https | https-lanes | websocket | websocket-lanes
 BASE_PATH=""               # base_path vhost'а, напр. telegram/web
 VERSION="latest"           # тег релиза telemt или latest
 EMAIL=""                   # e-mail для certbot (иначе --register-unsafely-without-email)
+CERT_METHOD="webroot"      # webroot | standalone
+NO_FIREWALL=0              # 1 -> не трогать ufw/firewalld
 LOG_LEVEL="normal"         # debug|verbose|normal|silent
 MAX_SESSIONS=16
 MAX_STREAMS=512
@@ -86,6 +88,8 @@ Usage: install.sh [OPTIONS]
   --decoy URL            внешний decoy-upstream, напр. http://127.0.0.1:8080
                          (по умолчанию ставится встроенный статический сайт)
   --email EMAIL          e-mail для Let's Encrypt
+  --cert-method M        webroot (def, рекомендуется) | standalone
+  --no-firewall          не открывать 80/443 в ufw/firewalld автоматически
   --version TAG          версия telemt (def latest)
   --skip-cert            пропустить выпуск сертификата (если уже есть)
   --uninstall            удалить сервис и конфиги (оставить данные)
@@ -161,6 +165,15 @@ detect_public_ip() {
     return 1
 }
 
+# занят ли TCP-порт (любой адрес)
+port_in_use() {
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+    elif command -v netstat >/dev/null 2>&1; then
+        netstat -tln 2>/dev/null | awk '{print $4}' | grep -qE "[:.]$1\$"
+    else return 1; fi
+}
+
 # nginx >= 1.25.1 использует директиву "http2 on;", старые — "listen ... http2"
 nginx_http2_modern() {
     v="$(nginx -v 2>&1 | sed 's/.*nginx\///' | tr -d ' ')"
@@ -187,6 +200,8 @@ while [ $# -gt 0 ]; do
         --mtproxy-public)  MTPROXY_PUBLIC=1; shift ;;
         --decoy)           DECOY_UPSTREAM="$2"; DECOY_GIVEN=1; shift 2 ;;
         --email)           EMAIL="$2"; shift 2 ;;
+        --cert-method)     CERT_METHOD="$2"; shift 2 ;;
+        --no-firewall)     NO_FIREWALL=1; shift ;;
         --version)         VERSION="$2"; shift 2 ;;
         --log-level)       LOG_LEVEL="$2"; shift 2 ;;
         --skip-cert)       SKIP_CERT=1; shift ;;
@@ -201,6 +216,8 @@ done
 [ "$SECRET_MODE" = "dd" ] || [ "$SECRET_MODE" = "plain" ] || die "--secret-mode: dd или plain"
 case "$PUBLIC_PORT" in ''|*[!0-9]*) die "--port должен быть числом" ;; esac
 [ "$PUBLIC_PORT" -ge 1 ] && [ "$PUBLIC_PORT" -le 65535 ] || die "--port: диапазон 1-65535"
+[ "$CERT_METHOD" = "webroot" ] || [ "$CERT_METHOD" = "standalone" ] \
+    || die "--cert-method: webroot или standalone"
 
 STREAM_BEGIN="# >>> telemt-web-proxy stream >>>"
 STREAM_END="# <<< telemt-web-proxy stream <<<"
@@ -220,7 +237,9 @@ do_uninstall() {
         sed -i "/$(printf '%s' "$STREAM_BEGIN" | sed 's/[][\.*^$/]/\\&/g')/,/$(printf '%s' "$STREAM_END" | sed 's/[][\.*^$/]/\\&/g')/d" /etc/nginx/nginx.conf
         say "  stream-блок удалён из nginx.conf"
     fi
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/telemt-nginx.sh
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/telemt-nginx.sh \
+          /etc/letsencrypt/renewal-hooks/pre/telemt-stop-nginx.sh \
+          /etc/letsencrypt/renewal-hooks/post/telemt-start-nginx.sh
     if command -v nginx >/dev/null 2>&1 && nginx -t 2>/dev/null; then
         systemctl reload nginx 2>/dev/null || true
     fi
@@ -290,6 +309,30 @@ chown telemt:telemt "$CONFIG_DIR"; chmod 750 "$CONFIG_DIR"
 
 say ">>> [4/9] ACME-виртхост на :80 и decoy-сайт"
 
+# фаервол: открываем 80 (http-01) и публичный порт, если не --no-firewall
+if [ "$NO_FIREWALL" -eq 0 ]; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "status: active"; then
+        ufw allow 80/tcp >/dev/null; ufw allow "${PUBLIC_PORT}/tcp" >/dev/null
+        [ "$MTPROXY_PUBLIC" -eq 1 ] && ufw allow "${MTPROXY_PORT}/tcp" >/dev/null || true
+        say "  ufw: открыты 80/tcp и ${PUBLIC_PORT}/tcp"
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port=80/tcp --add-port="${PUBLIC_PORT}/tcp" >/dev/null
+        [ "$MTPROXY_PUBLIC" -eq 1 ] && firewall-cmd --permanent --add-port="${MTPROXY_PORT}/tcp" >/dev/null || true
+        firewall-cmd --reload >/dev/null
+        say "  firewalld: открыты 80/tcp и ${PUBLIC_PORT}/tcp"
+    fi
+fi
+
+# снимаем default_server с чужих :80-блоков (стоковый сайт Debian/Ubuntu
+# перехватывает ACME-запросы -> 404 -> Let's Encrypt отказывает)
+for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+    [ -f "$f" ] || continue
+    if grep -qE '^\s*listen\s+(\[::\]:)?80\b[^;]*default_server' "$f" 2>/dev/null; then
+        sed -i 's/^\(\s*listen\s\+\(\[::\]:\)\?80\b[^;]*\)\s*default_server/\1/' "$f"
+        say "  снят default_server с :80 в $f"
+    fi
+done
+
 # :80 — только ACME-challenge и редирект на https (с портом, если не 443)
 if [ "$PUBLIC_PORT" -eq 443 ]; then HTTPS_REDIRECT='https://$host$request_uri';
 else HTTPS_REDIRECT="https://\$host:${PUBLIC_PORT}\$request_uri"; fi
@@ -328,20 +371,68 @@ server {
 EOF
 fi
 
-nginx -t 2>/dev/null || { # конфликт default_server на :80 — убираем флаг
-    sed -i 's/listen 80 default_server;/listen 80;/' /etc/nginx/conf.d/telemt-acme.conf
-    nginx -t || die "nginx -t не прошёл — проверьте конфигурацию"
-}
-systemctl enable --now nginx 2>/dev/null || systemctl restart nginx
+if [ "$CERT_METHOD" = "webroot" ]; then
+    nginx -t || die "nginx -t не прошёл — проверьте конфигурацию (nginx -T)"
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl restart nginx
+else
+    # standalone: certbot сам биндит :80 — порт должен быть свободен
+    if port_in_use 80; then
+        die ":80 занят — для --cert-method standalone освободите порт или используйте webroot"
+    fi
+fi
 
 say ">>> [5/9] Сертификат Let's Encrypt для $DOMAIN"
 CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
+
+# предпроверка: домен должен резолвиться в наш публичный IP
+DOMAIN_IP="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+if [ -n "$DOMAIN_IP" ] && [ "$DOMAIN_IP" != "$PUBLIC_IP" ]; then
+    warn "DNS: $DOMAIN -> $DOMAIN_IP, а публичный IP сервера -> $PUBLIC_IP"
+    warn "если $DOMAIN_IP не ваш — проверьте DNS или задайте --ip/--domain"
+fi
+
+cert_failed() {
+    say "" >&2
+    say "----- хвост /var/log/letsencrypt/letsencrypt.log -----" >&2
+    tail -60 /var/log/letsencrypt/letsencrypt.log 2>/dev/null \
+        | grep -iE 'error|detail|status|invalid|timeout|refused|404|urn:' | tail -15 >&2
+    say "------------------------------------------------------" >&2
+    die "certbot не выпустил сертификат. Частые причины:
+  * снаружи закрыт порт 80 (ufw/firewalld/Security Group у хостера)
+  * DNS ${DOMAIN} не указывает на ${PUBLIC_IP}
+  * другой :80 server-блок перехватывает запросы — см. 'nginx -T | grep default_server'"
+}
+
 if [ "$SKIP_CERT" -eq 0 ] && [ ! -f "${CERT_DIR}/fullchain.pem" ]; then
     if [ -n "$EMAIL" ]; then CB_AUTH="--email $EMAIL"; else CB_AUTH="--register-unsafely-without-email"; fi
-    # shellcheck disable=SC2086
-    certbot certonly --webroot -w /var/www/acme -d "$DOMAIN" \
-        --non-interactive --agree-tos $CB_AUTH \
-        || die "certbot не выпустил сертификат. Проверьте DNS ($DOMAIN -> $PUBLIC_IP) и порт 80"
+
+    if [ "$CERT_METHOD" = "webroot" ]; then
+        # самопроверка доступности ACME-пути снаружи
+        CHECK_TOKEN="chk$(gen_secret)"
+        mkdir -p /var/www/acme/.well-known/acme-challenge
+        printf '%s' "$CHECK_TOKEN" > /var/www/acme/.well-known/acme-challenge/telemt-check
+        sleep 1
+        if ! curl -fs -m 8 "http://${DOMAIN}/.well-known/acme-challenge/telemt-check" 2>/dev/null | grep -q "$CHECK_TOKEN"; then
+            warn "самопроверка http://${DOMAIN}/.well-known/acme-challenge/ не прошла"
+            warn "проверьте: порт 80 открыт снаружи? DNS -> $PUBLIC_IP? (hairpin-NAT даёт ложный негатив)"
+            warn "продолжаю — окончательный вердикт вынесет Let's Encrypt"
+        fi
+        rm -f /var/www/acme/.well-known/acme-challenge/telemt-check
+
+        # shellcheck disable=SC2086
+        certbot certonly --webroot -w /var/www/acme -d "$DOMAIN" \
+            --non-interactive --agree-tos $CB_AUTH || cert_failed
+    else
+        # shellcheck disable=SC2086
+        certbot certonly --standalone -d "$DOMAIN" \
+            --non-interactive --agree-tos $CB_AUTH || cert_failed
+        # при standalone-продлении certbot опять займёт :80 — гасим nginx на время
+        mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
+        printf '#!/bin/sh\nsystemctl stop nginx\n' > /etc/letsencrypt/renewal-hooks/pre/telemt-stop-nginx.sh
+        printf '#!/bin/sh\nsystemctl start nginx\n' > /etc/letsencrypt/renewal-hooks/post/telemt-start-nginx.sh
+        chmod +x /etc/letsencrypt/renewal-hooks/pre/telemt-stop-nginx.sh /etc/letsencrypt/renewal-hooks/post/telemt-start-nginx.sh
+    fi
 else
     say "  сертификат уже есть или --skip-cert — пропускаю"
 fi
@@ -351,7 +442,7 @@ fi
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 cat > /etc/letsencrypt/renewal-hooks/deploy/telemt-nginx.sh <<'EOF'
 #!/bin/sh
-nginx -t && systemctl reload nginx
+nginx -t && { systemctl reload nginx 2>/dev/null || systemctl start nginx; }
 EOF
 chmod +x /etc/letsencrypt/renewal-hooks/deploy/telemt-nginx.sh
 
@@ -527,7 +618,7 @@ EOF
 fi
 
 nginx -t || die "nginx -t не прошёл"
-systemctl reload nginx
+systemctl is-active --quiet nginx && systemctl reload nginx || systemctl restart nginx
 
 say ">>> [9/9] systemd-сервис telemt"
 cat > "/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
