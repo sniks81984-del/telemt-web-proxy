@@ -497,6 +497,12 @@ ${USER_NAME} = "${SECRET}"
 [server]
 listen_addr_ipv4 = "127.0.0.1"
 
+# Control API — только loopback, иначе управление юзерами торчит наружу
+[server.api]
+enabled = true
+listen = "127.0.0.1:9091"
+whitelist = ["127.0.0.1/32"]
+
 [[server.listeners]]
 ip = "${MTPROXY_BIND}"
 port = ${MTPROXY_PORT}
