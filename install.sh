@@ -31,6 +31,7 @@ SERVICE_NAME="telemt"
 
 DOMAIN=""                  # публичный FQDN; по умолчанию <IP>.sslip.io
 PUBLIC_IP=""               # автодетект, можно переопределить --ip
+PUBLIC_PORT=443            # публичный HTTPS-порт (nginx listen / stream listen)
 MODE="direct"              # direct | sni
 SNI_FALLBACK="127.0.0.1:7443"
 WEB_PORT=18080             # loopback WEB-listener telemt
@@ -69,6 +70,7 @@ Usage: install.sh [OPTIONS]
 
   --domain FQDN          публичный домен (по умолчанию <публичный-IP>.sslip.io)
   --ip A.B.C.D           публичный IP (автодетект, если не задан)
+  --port N               публичный HTTPS-порт (def 443; tg://webproxy требует 443)
   --mode direct|sni      direct: nginx держит 443 сам;
                          sni: ssl_preread на 443, домен -> loopback TLS-vhost
   --sni-fallback H:P     куда слать прочий SNI в режиме sni (def 127.0.0.1:7443)
@@ -79,6 +81,7 @@ Usage: install.sh [OPTIONS]
   --base-path P          base_path vhost'а, напр. telegram/web (def пусто)
   --web-port N           loopback порт WEB-listener telemt (def 18080)
   --mtproxy-port N       порт MTProto-listener (def 18443, loopback)
+  --tls-vhost-port N     loopback порт TLS-vhost nginx в режиме sni (def 18444)
   --mtproxy-public       MTProto-listener на 0.0.0.0 (выдаст tg://proxy ссылку)
   --decoy URL            внешний decoy-upstream, напр. http://127.0.0.1:8080
                          (по умолчанию ставится встроенный статический сайт)
@@ -170,6 +173,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --domain)          DOMAIN="$2"; shift 2 ;;
         --ip)              PUBLIC_IP="$2"; shift 2 ;;
+        --port)            PUBLIC_PORT="$2"; shift 2 ;;
         --mode)            MODE="$2"; shift 2 ;;
         --sni-fallback)    SNI_FALLBACK="$2"; shift 2 ;;
         --secret)          SECRET="$2"; shift 2 ;;
@@ -179,6 +183,7 @@ while [ $# -gt 0 ]; do
         --base-path)       BASE_PATH="$2"; shift 2 ;;
         --web-port)        WEB_PORT="$2"; shift 2 ;;
         --mtproxy-port)    MTPROXY_PORT="$2"; shift 2 ;;
+        --tls-vhost-port)  TLS_VHOST_PORT="$2"; shift 2 ;;
         --mtproxy-public)  MTPROXY_PUBLIC=1; shift ;;
         --decoy)           DECOY_UPSTREAM="$2"; DECOY_GIVEN=1; shift 2 ;;
         --email)           EMAIL="$2"; shift 2 ;;
@@ -194,6 +199,8 @@ done
 
 [ "$MODE" = "direct" ] || [ "$MODE" = "sni" ] || die "--mode: только direct или sni"
 [ "$SECRET_MODE" = "dd" ] || [ "$SECRET_MODE" = "plain" ] || die "--secret-mode: dd или plain"
+case "$PUBLIC_PORT" in ''|*[!0-9]*) die "--port должен быть числом" ;; esac
+[ "$PUBLIC_PORT" -ge 1 ] && [ "$PUBLIC_PORT" -le 65535 ] || die "--port: диапазон 1-65535"
 
 STREAM_BEGIN="# >>> telemt-web-proxy stream >>>"
 STREAM_END="# <<< telemt-web-proxy stream <<<"
@@ -283,14 +290,16 @@ chown telemt:telemt "$CONFIG_DIR"; chmod 750 "$CONFIG_DIR"
 
 say ">>> [4/9] ACME-виртхост на :80 и decoy-сайт"
 
-# :80 — только ACME-challenge и редирект на https
+# :80 — только ACME-challenge и редирект на https (с портом, если не 443)
+if [ "$PUBLIC_PORT" -eq 443 ]; then HTTPS_REDIRECT='https://$host$request_uri';
+else HTTPS_REDIRECT="https://\$host:${PUBLIC_PORT}\$request_uri"; fi
 cat > /etc/nginx/conf.d/telemt-acme.conf <<EOF
 # telemt-web-proxy: ACME http-01 + редирект
 server {
     listen 80 default_server;
     server_name _;
     location /.well-known/acme-challenge/ { root /var/www/acme; }
-    location / { return 301 https://\$host\$request_uri; }
+    location / { return 301 ${HTTPS_REDIRECT}; }
 }
 EOF
 
@@ -418,7 +427,7 @@ http_connection_capacity_action = "drop"
 [[web.vhosts]]
 host = "${DOMAIN}"
 base_path = "${BASE_PATH}"
-public_addr = "${PUBLIC_IP}:443"
+public_addr = "${PUBLIC_IP}:${PUBLIC_PORT}"
 
 [web.vhosts.decoy]
 mode = "http_upstream"
@@ -448,7 +457,7 @@ fi
 if [ "$MODE" = "sni" ]; then
     TLS_LISTEN="listen 127.0.0.1:${TLS_VHOST_PORT} ${H2_LISTEN};"
 else
-    TLS_LISTEN="listen 443 ${H2_LISTEN};"
+    TLS_LISTEN="listen ${PUBLIC_PORT} ${H2_LISTEN};"
 fi
 
 cat > /etc/nginx/conf.d/telemt-web.conf <<EOF
@@ -508,7 +517,7 @@ stream {
     upstream telemt_ssl { server 127.0.0.1:${TLS_VHOST_PORT}; }
     upstream sni_fallback { server ${SNI_FALLBACK}; }
     server {
-        listen 443;
+        listen ${PUBLIC_PORT};
         proxy_pass \$telemt_backend;
         ssl_preread on;
     }
@@ -552,9 +561,16 @@ say " УСТАНОВКА ЗАВЕРШЕНА"
 say "============================================================"
 say "  Домен:        $DOMAIN"
 say "  Публичный IP: $PUBLIC_IP"
+say "  Порт:         $PUBLIC_PORT"
 say "  Пользователь: $USER_NAME"
 say "  Секрет:       $SECRET"
 say "  Режим nginx:  $MODE"
+say ""
+if [ "$PUBLIC_PORT" -ne 443 ]; then
+    say ""
+    warn "порт ${PUBLIC_PORT} != 443: ссылки tg://webproxy в Telegram Desktop"
+    warn "работают только на 443. Подключение: ${DOMAIN}:${PUBLIC_PORT}"
+fi
 say ""
 say "  WEB-ссылка (Telegram Desktop):"
 if [ "$SECRET_MODE" = "dd" ]; then

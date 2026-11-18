@@ -66,7 +66,8 @@ tg://webproxy?server=<домен>&secret=dd<секрет>
 | Флаг | Описание |
 |---|---|
 | `--domain FQDN` | публичный домен (def `<IP>.sslip.io`) |
-| `--mode direct\|sni` | `direct` — nginx держит 443 сам; `sni` — ssl_preread-роутинг |
+| `--port N` | публичный HTTPS-порт (def `443`; `tg://webproxy` требует 443) |
+| `--mode direct\|sni` | `direct` — nginx держит порт сам; `sni` — ssl_preread-роутинг |
 | `--sni-fallback H:P` | бэкенд для прочего SNI в режиме sni (def `127.0.0.1:7443`) |
 | `--secret HEX32` | свой секрет (по умолчанию генерируется) |
 | `--carrier C` | `https` (совместимость, iOS) / `https-lanes` / `websocket` / `websocket-lanes` |
@@ -99,6 +100,7 @@ sudo sh install.sh --purge       # + бинарь, /etc/telemt, юзер telemt
 
 - WEB-режим telemt требует `plain` или `dd` секреты; `ee` (FakeTLS) не поддерживается транспортом WEB.
 - Клиент: Telegram Desktop с типом прокси `WEB` (ссылка `tg://webproxy`). iOS-клиенты работают только с `--carrier https`.
+- `--port` позволяет повесить прокси на другой порт, но официальные ссылки `tg://webproxy` в Telegram Desktop работают **только на 443**. Нестандартный порт имеет смысл за NAT/DNAT (внешний 443 → внутренний `--port`) или для кастомных клиентов.
 - В режиме `sni` скрипт дописывает маркированный `stream {}`-блок в `nginx.conf`; если `stream {}` уже существует — установка остановится с инструкцией для ручного мержа.
 
 ---
