@@ -1,6 +1,6 @@
 # telemt-web-proxy
 
-Автоустановка **WEB-прокси для Telegram** на базе [telemt](https://github.com/telemt/telemt) — MTProxy-сервера на Rust с поддержкой транспорта `WEB` (HTTPS / WebSocket carrier для Telegram Desktop).
+Автоустановка **WEB-прокси для Telegram** на базе [telemt](https://github.com/telemt/telemt) — MTProxy-сервера на Rust с поддержкой транспорта `WEB` (HTTPS / WebSocket carrier ).
 
 Скрипт разворачивает production-связку:
 
